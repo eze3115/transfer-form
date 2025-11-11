@@ -1,0 +1,194 @@
+import express from 'express';
+import { pool } from './db.js';
+import { sendEmail } from './email.js';
+import { buildPdf } from './pdf.js';
+import { customAlphabet } from 'nanoid';
+
+const router = express.Router();
+const nanoid = customAlphabet('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz', 32);
+
+const ROLES = [
+  'employee',
+  'current_supervisor',
+  'current_pd',
+  'new_supervisor',
+  'new_pd'
+];
+
+function nextRole(role) {
+  const idx = ROLES.indexOf(role);
+  return idx >= 0 && idx < ROLES.length - 1 ? ROLES[idx + 1] : null;
+}
+
+router.post('/request', async (req, res) => {
+  try {
+    const { data, employee, currentSupervisor, currentPD, newSupervisor, newPD, requesterEmail } = req.body;
+
+    if (!data || !employee?.email || !requesterEmail) {
+      return res.status(400).json({ error: 'Missing required fields.' });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const r = await client.query(
+        `insert into requests (data, requester_email) values ($1, $2) returning *`,
+        [data, requesterEmail]
+      );
+      const request = r.rows[0];
+
+      const signerInputs = [
+        { role: 'employee', ...employee, order_index: 0 },
+        { role: 'current_supervisor', ...currentSupervisor, order_index: 1 },
+        { role: 'current_pd', ...currentPD, order_index: 2 },
+        { role: 'new_supervisor', ...newSupervisor, order_index: 3 },
+        { role: 'new_pd', ...newPD, order_index: 4 }
+      ].filter(s => s && s.email);
+
+      for (const s of signerInputs) {
+        const token = nanoid();
+        await client.query(
+          `insert into signers (request_id, role, name, email, order_index, token)
+           values ($1, $2, $3, $4, $5, $6)`,
+          [request.id, s.role, s.name || null, s.email, s.order_index, token]
+        );
+      }
+
+      await client.query('COMMIT');
+
+      // Email the first signer (employee)
+      const first = await client.query(
+        `select * from signers where request_id=$1 and role='employee'`,
+        [request.id]
+      );
+      const s = first.rows[0];
+      if (s) await emailSigner(request, s);
+
+      return res.json({ ok: true, requestId: request.id });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.get('/sign/:token', async (req, res) => {
+  const { token } = req.params;
+  const r = await pool.query(`
+    select s.*, to_jsonb(rq.*) as request
+    from signers s join requests rq on rq.id = s.request_id
+    where s.token=$1
+  `, [token]);
+  const row = r.rows[0];
+  if (!row) return res.status(404).json({ error: 'Invalid token' });
+
+  // Hide other signer emails from the client
+  const signers = await pool.query(`select role, name, signed_at, decision from signers where request_id=$1 order by order_index asc`, [row.request_id]);
+  return res.json({
+    signer: { id: row.id, role: row.role, name: row.name, email: row.email, order_index: row.order_index },
+    request: { id: row.request.id, data: row.request.data },
+    progress: signers.rows
+  });
+});
+
+router.post('/sign/:token', async (req, res) => {
+  const { token } = req.params;
+  const { signatureDataUrl, decision, decisionReason, agreedLastDate, staffingReviewed, signerName } = req.body;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const r = await client.query(`select * from signers where token=$1 for update`, [token]);
+    const s = r.rows[0];
+    if (!s) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Invalid token' });
+    }
+    if (s.signed_at) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Already signed' });
+    }
+
+    // update signer
+    const now = new Date();
+    await client.query(
+      `update signers set name=coalesce($1,name), signature_data_url=$2, decision=$3, decision_reason=$4, agreed_last_date=$5, staffing_reviewed=$6, signed_at=$7 where id=$8`,
+      [signerName || null, signatureDataUrl || null, decision || null, decisionReason || null, agreedLastDate || null, staffingReviewed || false, now, s.id]
+    );
+
+    // get request
+    const rq = await client.query(`select * from requests where id=$1 for update`, [s.request_id]);
+    const request = rq.rows[0];
+
+    // route to next signer or finalize
+    const next = nextRole(s.role);
+    if (next) {
+      const nx = await client.query(`select * from signers where request_id=$1 and role=$2`, [s.request_id, next]);
+      const ns = nx.rows[0];
+      if (ns) await emailSigner(request, ns);
+    } else {
+      // finalize: build PDF and email all + HR
+      const all = await client.query(`select * from signers where request_id=$1 order by order_index asc`, [s.request_id]);
+      const pdfPath = await buildPdf({ request, signers: all.rows });
+      const finalUrl = pdfPath; // In production, upload to S3/GCS and save URL
+      await client.query(`update requests set status='completed', final_pdf_url=$1 where id=$2`, [finalUrl, s.request_id]);
+      await emailAllFinal(request, all.rows, finalUrl);
+    }
+
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    client.release();
+  }
+});
+
+async function emailSigner(request, signer) {
+  const appBase = process.env.APP_BASE_URL || 'http://localhost:5173';
+  const link = `${appBase}/sign/${signer.token}`;
+  await sendEmail({
+    to: signer.email,
+    subject: `Action Required: ${prettyRole(signer.role)} signature for Transfer Request`,
+    html: `
+      <p>Hello ${signer.name || ''},</p>
+      <p>Please review and sign the Transfer/Change Schedule Request.</p>
+      <p><a href="${link}">Open your secure signing link</a></p>
+    `
+  });
+}
+
+async function emailAllFinal(request, signers, pdfPath) {
+  const to = new Set([request.requester_email]);
+  for (const s of signers) if (s.email) to.add(s.email);
+  if (process.env.HR_NOTIFICATIONS) to.add(process.env.HR_NOTIFICATIONS);
+
+  await sendEmail({
+    to: Array.from(to),
+    subject: 'Transfer Request – Completed',
+    html: `
+      <p>The Transfer/Change Schedule Request is fully signed.</p>
+      <p>PDF saved at server path: ${pdfPath}</p>
+    `
+  });
+}
+
+function prettyRole(r) {
+  return ({
+    employee: 'Employee',
+    current_supervisor: 'Current Supervisor',
+    current_pd: 'Current Program Director',
+    new_supervisor: 'New Supervisor',
+    new_pd: 'New Program Director'
+  })[r] || r;
+}
+
+export default router;
