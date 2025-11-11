@@ -1,0 +1,111 @@
+import PDFDocument from 'pdfkit';
+import fs from 'fs';
+import path from 'path';
+
+export async function buildPdf({ request, signers }) {
+  const outDir = path.join(process.cwd(), 'generated');
+  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir);
+  const outPath = path.join(outDir, `${request.id}.pdf`);
+
+  const doc = new PDFDocument({ size: 'LETTER', margin: 36 });
+  const stream = fs.createWriteStream(outPath);
+  doc.pipe(stream);
+
+  const data = request.data || {};
+  const yesNo = v => v === true ? 'YES' : v === false ? 'NO' : '';
+
+  doc.fontSize(16).text('Transfer / Change Schedule Request', { align: 'center' });
+  doc.moveDown();
+
+  // Employee section
+  doc.fontSize(12).text(`Employee Name: ${data.employeeName || ''}`);
+  doc.moveDown(0.5);
+
+  doc.text('Current Schedule:');
+  table(doc, data.currentSchedule || []);
+
+  doc.moveDown(0.5);
+  doc.text('Requested New Schedule:');
+  table(doc, data.newSchedule || []);
+
+  doc.moveDown(0.5);
+  doc.text(`Reason for Transfer: ${data.reason || ''}`);
+  doc.moveDown(0.5);
+
+  doc.text(`Spoke with direct supervisor? ${yesNo(data.flags?.spokeWithSupervisor)}`);
+  doc.text(`Completed at least 12 months? ${yesNo(data.flags?.twelveMonths)}`);
+  doc.text(`No corrective actions last 12 months? ${yesNo(data.flags?.noCorrectiveActions)}`);
+  doc.text(`If any NO, discussed with supervisor? ${yesNo(data.flags?.discussedIfNo)}`);
+  doc.text(`Requested Start Date: ${data.requestedStartDate || ''}`);
+
+  const emp = signers.find(s => s.role === 'employee');
+  if (emp) {
+    doc.moveDown(0.5);
+    doc.text(`Employee Signature / Date: ${emp.name || ''} / ${emp.signed_at ? new Date(emp.signed_at).toLocaleDateString() : ''}`);
+    if (emp.signature_data_url) imageDataUrl(doc, emp.signature_data_url, 200, doc.y + 4, 150, 40);
+  }
+
+  // Approvals
+  const blocks = [
+    { title: 'Current Supervisor', role: 'current_supervisor' },
+    { title: 'Current Program Director', role: 'current_pd' },
+    { title: 'New Supervisor', role: 'new_supervisor' },
+    { title: 'New Program Director', role: 'new_pd' }
+  ];
+
+  blocks.forEach(b => {
+    const s = signers.find(x => x.role === b.role);
+    doc.moveDown();
+    doc.fontSize(13).text(b.title, { underline: true });
+    doc.fontSize(12);
+    if (s) {
+      doc.text(`Name: ${s.name || ''}`);
+      doc.text(`Decision: ${s.decision || ''}`);
+      if (s.decision === 'NO' && s.decision_reason) doc.text(`Reason: ${s.decision_reason}`);
+      doc.text(`Agreed Last Date: ${s.agreed_last_date || ''}`);
+      doc.text(`Staffing Schedule Reviewed: ${s.staffing_reviewed ? 'Yes' : 'No'}`);
+      doc.text(`Signed At: ${s.signed_at ? new Date(s.signed_at).toLocaleString() : ''}`);
+      if (s.signature_data_url) imageDataUrl(doc, s.signature_data_url, 200, doc.y + 4, 150, 40);
+    } else {
+      doc.text('Pending.');
+    }
+  });
+
+  doc.end();
+
+  await new Promise(res => stream.on('finish', res));
+  return outPath;
+}
+
+// helpers
+function table(doc, rows) {
+  // rows: [{ day, location, hours, position }, ...]
+  const headers = ['Day', 'Location', 'Hours', 'Position'];
+  const width = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const colW = width / headers.length;
+  const startY = doc.y;
+
+  doc.font('Helvetica-Bold');
+  headers.forEach((h, i) => doc.text(h, doc.x + i * colW, startY, { width: colW }));
+  doc.font('Helvetica');
+
+  let y = startY + 16;
+  rows.forEach(r => {
+    [r.day, r.location, r.hours, r.position].forEach((val, i) => {
+      doc.text(val || '', doc.x + i * colW, y, { width: colW });
+    })
+    y += 16;
+  });
+  doc.moveDown();
+}
+
+function imageDataUrl(doc, dataUrl, x, y, w, h) {
+  try {
+    const parts = dataUrl.split(',');
+    const b64 = parts[1];
+    const buf = Buffer.from(b64, 'base64');
+    doc.image(buf, x, y, { width: w, height: h });
+  } catch (e) {
+    // ignore
+  }
+}
