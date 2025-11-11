@@ -1,0 +1,156 @@
+import React, { useState } from 'react'
+
+const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+
+const DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+
+function ScheduleTable({ title, rows, setRows }){
+  const update = (i, key, val) => {
+    const next = rows.slice();
+    next[i] = { ...next[i], [key]: val };
+    setRows(next);
+  };
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <h3>{title}</h3>
+      {rows.map((r,i) => (
+        <div key={i} style={{ display: 'grid', gridTemplateColumns: '120px 1fr 1fr 1fr', gap: 8, marginBottom: 6 }}>
+          <select value={r.day||''} onChange={e=>update(i,'day', e.target.value)}>
+            <option value=''>Day</option>
+            {DAYS.map(d => <option key={d} value={d}>{d}</option>)}
+          </select>
+          <input placeholder='Location' value={r.location||''} onChange={e=>update(i,'location', e.target.value)} />
+          <input placeholder='Hours' value={r.hours||''} onChange={e=>update(i,'hours', e.target.value)} />
+          <input placeholder='Position' value={r.position||''} onChange={e=>update(i,'position', e.target.value)} />
+        </div>
+      ))}
+      <button onClick={()=>setRows([...rows, {}])}>+ Add Row</button>
+    </div>
+  );
+}
+
+export default function TransferForm(){
+  const [employeeName, setEmployeeName] = useState('')
+  const [reason, setReason] = useState('')
+  const [requestedStartDate, setRequestedStartDate] = useState('')
+  const [flags, setFlags] = useState({ spokeWithSupervisor:false, twelveMonths:false, noCorrectiveActions:false, discussedIfNo:false })
+
+  const [currentRows, setCurrentRows] = useState([{}])
+  const [newRows, setNewRows] = useState([{}])
+
+  // routing
+  const [employee, setEmployee] = useState({ name:'', email:'' })
+  const [currentSupervisor, setCurrentSupervisor] = useState({ name:'', email:'' })
+  const [currentPD, setCurrentPD] = useState({ name:'', email:'' })
+  const [newSupervisor, setNewSupervisor] = useState({ name:'', email:'' })
+  const [newPD, setNewPD] = useState({ name:'', email:'' })
+
+  const [requesterEmail, setRequesterEmail] = useState('')
+
+  const [submitting, setSubmitting] = useState(false)
+  const [ok, setOk] = useState(false)
+  const [error, setError] = useState('')
+
+  const submit = async () => {
+    setSubmitting(true); setError('');
+    try {
+      const payload = {
+        data: {
+          employeeName, reason, requestedStartDate, flags,
+          currentSchedule: currentRows,
+          newSchedule: newRows
+        },
+        employee,
+        currentSupervisor,
+        currentPD,
+        newSupervisor,
+        newPD,
+        requesterEmail
+      };
+      const r = await fetch(`${API}/api/request`, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || 'Failed');
+      setOk(true);
+    } catch(e) {
+      setError(e.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const cb = (k, v) => setFlags(prev => ({...prev, [k]: v==='YES'}))
+
+  return (
+    <div>
+      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap: 12 }}>
+        <div>
+          <label>Employee Name</label>
+          <input value={employeeName} onChange={e=>setEmployeeName(e.target.value)} />
+        </div>
+        <div>
+          <label>Requested Start Date</label>
+          <input type='date' value={requestedStartDate} onChange={e=>setRequestedStartDate(e.target.value)} />
+        </div>
+      </div>
+
+      <ScheduleTable title='Current Schedule' rows={currentRows} setRows={setCurrentRows} />
+      <ScheduleTable title='Requested New Schedule' rows={newRows} setRows={setNewRows} />
+
+      <div>
+        <label>Reason for Transfer</label>
+        <textarea value={reason} onChange={e=>setReason(e.target.value)} rows={4} style={{ width:'100%' }} />
+      </div>
+
+      <div style={{ display:'grid', gridTemplateColumns:'1fr 120px', alignItems:'center', gap: 8, marginTop: 12 }}>
+        <span>I have spoken with my direct supervisor regarding my transfer request</span>
+        <select onChange={e=>cb('spokeWithSupervisor', e.target.value)}>
+          <option>—</option><option>YES</option><option>NO</option>
+        </select>
+
+        <span>I have completed at least twelve (12) months in my current position</span>
+        <select onChange={e=>cb('twelveMonths', e.target.value)}>
+          <option>—</option><option>YES</option><option>NO</option>
+        </select>
+
+        <span>I have not received any corrective actions in the last twelve (12) months</span>
+        <select onChange={e=>cb('noCorrectiveActions', e.target.value)}>
+          <option>—</option><option>YES</option><option>NO</option>
+        </select>
+
+        <span>If any answer is NO, I have discussed this with my supervisor</span>
+        <select onChange={e=>cb('discussedIfNo', e.target.value)}>
+          <option>—</option><option>YES</option><option>NO</option>
+        </select>
+      </div>
+
+      <h2 style={{ marginTop: 24 }}>Routing (emails for signers)</h2>
+      {[
+        ['Employee', employee, setEmployee],
+        ['Current Supervisor', currentSupervisor, setCurrentSupervisor],
+        ['Current Program Director', currentPD, setCurrentPD],
+        ['New Supervisor', newSupervisor, setNewSupervisor],
+        ['New Program Director', newPD, setNewPD],
+      ].map(([label, value, setter]) => (
+        <div key={label} style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap: 8, marginBottom: 8 }}>
+          <div><label>{label} Name</label><input value={value.name||''} onChange={e=>setter({...value, name:e.target.value})} /></div>
+          <div><label>{label} Email</label><input value={value.email||''} onChange={e=>setter({...value, email:e.target.value})} /></div>
+        </div>
+      ))}
+
+      <div style={{ marginTop: 8 }}>
+        <label>Requester Email (CC on completion)</label>
+        <input value={requesterEmail} onChange={e=>setRequesterEmail(e.target.value)} style={{ width:'100%' }} />
+      </div>
+
+      <div style={{ marginTop: 16 }}>
+        <button disabled={submitting} onClick={submit}>Submit & Send to Employee</button>
+      </div>
+      {ok && <p style={{ color:'green' }}>Created! The Employee has been emailed a signing link.</p>}
+      {error && <p style={{ color:'red' }}>{error}</p>}
+    </div>
+  )
+}
