@@ -1,0 +1,124 @@
+import React, { useEffect, useRef, useState } from 'react'
+import { useParams } from 'react-router-dom'
+import SignatureCanvas from 'react-signature-canvas'
+
+const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+
+export default function SignerView(){
+  const { token } = useParams()
+  const [loading, setLoading] = useState(true)
+  const [data, setData] = useState(null)
+  const [name, setName] = useState('')
+  const [decision, setDecision] = useState('YES')
+  const [decisionReason, setDecisionReason] = useState('')
+  const [agreedLastDate, setAgreedLastDate] = useState('')
+  const [staffingReviewed, setStaffingReviewed] = useState(false)
+  const sigRef = useRef()
+
+  const [submitting, setSubmitting] = useState(false)
+  const [ok, setOk] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true)
+      try {
+        const r = await fetch(`${API}/api/sign/${token}`)
+        const j = await r.json()
+        if (!r.ok) throw new Error(j.error || 'Failed')
+        setData(j)
+      } catch(e) {
+        setError(e.message)
+      } finally {
+        setLoading(false)
+      }
+    })()
+  }, [token])
+
+  const submit = async () => {
+    setSubmitting(true); setError('')
+    try {
+      const signatureDataUrl = sigRef.current?.isEmpty() ? null : sigRef.current.getTrimmedCanvas().toDataURL('image/png')
+      const body = { signatureDataUrl, signerName: name, decision, decisionReason, agreedLastDate, staffingReviewed }
+      const r = await fetch(`${API}/api/sign/${token}`, {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+      })
+      const j = await r.json()
+      if (!r.ok) throw new Error(j.error || 'Failed')
+      setOk(true)
+    } catch(e) {
+      setError(e.message)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  if (loading) return <p>Loading…</p>
+  if (error) return <p style={{ color:'red' }}>{error}</p>
+  if (!data) return null
+
+  const { signer, request } = data
+  const isEmployee = signer.role === 'employee'
+  const showDecision = signer.role !== 'employee'
+
+  return (
+    <div style={{ maxWidth: 800, margin:'24px auto', padding:16 }}>
+      <h2>Sign: {prettyRole(signer.role)}</h2>
+      <div style={{ padding:12, border:'1px solid #ddd', borderRadius:8 }}>
+        <p><b>Employee Name:</b> {request.data.employeeName}</p>
+        <p><b>Requested Start Date:</b> {request.data.requestedStartDate}</p>
+        <p><b>Reason:</b> {request.data.reason}</p>
+      </div>
+
+      <div style={{ marginTop: 16 }}>
+        <label>Your Name</label>
+        <input value={name} onChange={e=>setName(e.target.value)} style={{ width:'100%' }} />
+      </div>
+
+      {showDecision && (
+        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginTop: 8 }}>
+          <div>
+            <label>Decision</label>
+            <select value={decision} onChange={e=>setDecision(e.target.value)}>
+              <option>YES</option>
+              <option>NO</option>
+            </select>
+          </div>
+          <div>
+            <label>Agreed Last Date (optional)</label>
+            <input value={agreedLastDate} onChange={e=>setAgreedLastDate(e.target.value)} placeholder='e.g., 2025-01-20' />
+          </div>
+          <div style={{ gridColumn:'1 / span 2' }}>
+            <label>Reason if NO</label>
+            <textarea value={decisionReason} onChange={e=>setDecisionReason(e.target.value)} rows={3} style={{ width:'100%' }} />
+          </div>
+          <div style={{ gridColumn:'1 / span 2' }}>
+            <label><input type='checkbox' checked={staffingReviewed} onChange={e=>setStaffingReviewed(e.target.checked)} /> Staffing Schedule Reviewed</label>
+          </div>
+        </div>
+      )}
+
+      <div style={{ marginTop: 16 }}>
+        <p><b>Signature</b></p>
+        <SignatureCanvas ref={sigRef} penColor='black' backgroundColor='rgba(0,0,0,0.02)' canvasProps={{width:600, height:160, className:'sigCanvas'}} />
+        <button onClick={()=>sigRef.current?.clear()} style={{ marginTop: 6 }}>Clear</button>
+      </div>
+
+      <div style={{ marginTop: 16 }}>
+        <button disabled={submitting} onClick={submit}>Submit</button>
+      </div>
+      {ok && <p style={{ color:'green' }}>Thanks! Your part is done. The next signer will be emailed automatically.</p>}
+      {error && <p style={{ color:'red' }}>{error}</p>}
+    </div>
+  )
+}
+
+function prettyRole(r){
+  return ({
+    employee:'Employee',
+    current_supervisor:'Current Supervisor',
+    current_pd:'Current Program Director',
+    new_supervisor:'New Supervisor',
+    new_pd:'New Program Director'
+  })[r] || r
+}
